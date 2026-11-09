@@ -1,22 +1,22 @@
 
 var WidgetMetadata = {
   id: "custom.iptv.m3u",
-  title: "自定义 IPTV · M3U",
-  description: "读取远程 M3U 播放列表，提取频道名称、台标和播放地址。",
+  title: "电视直播",
+  description: "多 M3U 源合并解析，自动去重，单源失败自动跳过。",
   author: "Custom",
   site: "https://github.com/leilanizulauf66-lgtm/rex-iptv-module",
-  version: "1.0.0",
+  version: "1.2.0",
   requiredVersion: "0.0.1",
   modules: [{
-    title: "电视台列表",
-    description: "读取 M3U 文件并按分组筛选频道。",
+    title: "电视直播",
+    description: "多个 M3U 地址合并为一个频道列表，支持分组筛选和图标缩放设置。",
     functionName: "loadM3UChannels",
     requiresWebView: false,
     cacheDuration: 300,
     params: [
       {
-        name: "playlistUrl",
-        title: "M3U 播放列表地址",
+        name: "playlistUrls",
+        title: "M3U 地址（每行一个）",
         type: "input",
         value: "https://iptv.yang-1989.xyz/playlist.m3u"
       },
@@ -25,6 +25,12 @@ var WidgetMetadata = {
         title: "分组筛选（可留空）",
         type: "input",
         value: ""
+      },
+      {
+        name: "iconScale",
+        title: "频道图标缩放比例（30-200）",
+        type: "input",
+        value: "100"
       }
     ]
   }]
@@ -37,11 +43,15 @@ function m3uAttr(line, name) {
   return match ? match[1].trim() : "";
 }
 
-function m3uParse(text, groupFilter) {
-  var lines = String(text || "")
-    .replace(/^\uFEFF/, "")
-    .split(/\r?\n/);
+function normalizeText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[（()）【】\[\]·_\-]/g, "");
+}
 
+function parseM3U(text, groupFilter, iconScale) {
+  var lines = String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/);
   var list = [];
   var current = null;
   var filter = String(groupFilter || "").trim().toLowerCase();
@@ -52,12 +62,11 @@ function m3uParse(text, groupFilter) {
 
     if (line.indexOf("#EXTINF:") === 0) {
       var comma = line.indexOf(",");
-      var name = comma >= 0 ? line.slice(comma + 1).trim() : "";
-
+      var displayName = comma >= 0 ? line.slice(comma + 1).trim() : "";
       current = {
-        title: m3uAttr(line, "tvg-name") || name || "未命名频道",
+        title: m3uAttr(line, "tvg-name") || displayName || "未命名频道",
         logo: m3uAttr(line, "tvg-logo"),
-        id: m3uAttr(line, "tvg-id"),
+        tvgId: m3uAttr(line, "tvg-id"),
         group: m3uAttr(line, "group-title")
       };
       continue;
@@ -71,10 +80,8 @@ function m3uParse(text, groupFilter) {
     if (line.charAt(0) === "#") continue;
 
     if (/^https?:\/\//i.test(line) && current) {
-      if (
-        !filter ||
-        String(current.group || "").toLowerCase().indexOf(filter) !== -1
-      ) {
+      var group = current.group || "";
+      if (!filter || group.toLowerCase().indexOf(filter) !== -1) {
         list.push({
           id: line,
           type: "url",
@@ -84,27 +91,69 @@ function m3uParse(text, groupFilter) {
           backdropPath: current.logo,
           videoUrl: line,
           playerType: "app",
-          description: current.group || ""
+          description: group,
+          iconScale: iconScale,
+          coverScale: iconScale,
+          _tvgId: current.tvgId
         });
       }
       current = null;
     }
   }
-
   return list;
+}
+
+function getDedupeKey(channel) {
+  var tvgId = normalizeText(channel._tvgId);
+  if (tvgId) return "id:" + tvgId;
+
+  var title = normalizeText(channel.title);
+  if (title) return "name:" + title;
+
+  return "url:" + String(channel.videoUrl || "");
+}
+
+async function fetchPlaylist(url) {
+  var response = await Widget.http.get(url, {
+    headers: { "User-Agent": "Mozilla/5.0" }
+  });
+
+  if (response && (response.statusCode >= 400 || response.status >= 400)) {
+    throw new Error("HTTP 请求失败");
+  }
+
+  var body = response && response.data !== undefined ? response.data : response;
+  if (typeof body !== "string") throw new Error("返回内容不是文本");
+  return body;
 }
 
 async function loadM3UChannels(params) {
   params = params || {};
 
-  var url = String(
+  var rawUrls = String(
+    params.playlistUrls ||
     params.playlistUrl ||
     "https://iptv.yang-1989.xyz/playlist.m3u"
-  ).trim();
+  );
 
-  if (!/^https?:\/\//i.test(url)) {
-    throw new Error("请输入有效的 M3U 地址");
+  var urls = rawUrls
+    .split(/[\r\n,;]+/)
+    .map(function (item) { return item.trim(); })
+    .filter(function (item, index, all) {
+      return item && all.indexOf(item) === index;
+    });
+
+  urls = urls.filter(function (url) {
+    return /^https?:\/\//i.test(url);
+  });
+
+  if (!urls.length) {
+    throw new Error("请至少填写一个有效的 M3U 地址（http:// 或 https://）");
   }
+
+  var rawScale = Number(params.iconScale || 100);
+  if (!isFinite(rawScale)) rawScale = 100;
+  var iconScale = Math.max(30, Math.min(200, Math.round(rawScale)));
 
   if (
     typeof Widget === "undefined" ||
@@ -114,32 +163,41 @@ async function loadM3UChannels(params) {
     throw new Error("当前 Rex 环境未提供 Widget.http.get 网络接口");
   }
 
-  var response = await Widget.http.get(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0"
+  var merged = [];
+
+  // 逐个读取，某个源失败不会影响其他源
+  for (var i = 0; i < urls.length; i++) {
+    try {
+      var text = await fetchPlaylist(urls[i]);
+      var parsed = parseM3U(text, params.groupFilter, iconScale);
+
+      for (var j = 0; j < parsed.length; j++) {
+        merged.push(parsed[j]);
+      }
+    } catch (error) {
+      // 跳过无法访问或格式错误的源
     }
-  });
-
-  if (
-    response &&
-    (response.statusCode >= 400 || response.status >= 400)
-  ) {
-    throw new Error("M3U 请求失败");
   }
 
-  var body = response && response.data !== undefined
-    ? response.data
-    : response;
-
-  if (typeof body !== "string") {
-    throw new Error("服务器返回内容不是 M3U 文本");
+  if (!merged.length) {
+    throw new Error(
+      "所有 M3U 地址均未解析到频道，请检查地址、网络或播放列表格式"
+    );
   }
 
-  var channels = m3uParse(body, params.groupFilter);
+  var seen = {};
+  var result = [];
 
-  if (!channels.length) {
-    throw new Error("没有解析到频道，请检查 M3U 地址或分组");
+  for (var k = 0; k < merged.length; k++) {
+    var channel = merged[k];
+    var key = getDedupeKey(channel);
+
+    if (seen[key]) continue;
+
+    seen[key] = true;
+    delete channel._tvgId;
+    result.push(channel);
   }
 
-  return channels;
+  return result;
 }
